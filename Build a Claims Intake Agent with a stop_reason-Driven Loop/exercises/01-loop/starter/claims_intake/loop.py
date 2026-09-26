@@ -69,7 +69,6 @@ def run(
         turn += 1
         budget.check()
         t0 = time.monotonic()
-
         response = client.messages.create(
             model=model,
             max_tokens=max_tokens,
@@ -77,30 +76,19 @@ def run(
             tools=tools,
             messages=working_messages,
         )
-
         latency_ms = (time.monotonic() - t0) * 1000.0
 
         input_tokens = int(response.usage.input_tokens)
         output_tokens = int(response.usage.output_tokens)
-
         total_input += input_tokens
         total_output += output_tokens
-
         budget.record_input_tokens(input_tokens)
 
-        # Build and write the trace record for this turn.
-        tool_calls = []
-
-        for block in response.content:
-            if getattr(block, "type", None) == "tool_use":
-                tool_calls.append(
-                    {
-                        "id": block.id,
-                        "name": block.name,
-                        "input": dict(block.input),
-                    }
-                )
-
+        tool_calls = [
+            {"id": b.id, "name": b.name, "input": b.input}
+            for b in response.content
+            if getattr(b, "type", None) == "tool_use"
+        ]
         tracer.write(
             {
                 "turn": turn,
@@ -112,60 +100,33 @@ def run(
             }
         )
 
-        # Case 1: The model is finished.
         if response.stop_reason == "end_turn":
-            working_messages.append(
-                {
-                    "role": "assistant",
-                    "content": response.content,
-                }
-            )
-
+            working_messages.append({"role": "assistant", "content": response.content})
             return FinalState(
                 messages=working_messages,
                 total_input_tokens=total_input,
                 total_output_tokens=total_output,
                 turn_count=turn,
-                final_content=response.content,
+                final_content=list(response.content),
             )
 
-        # Case 2: The model wants to use tools.
         if response.stop_reason == "tool_use":
-            working_messages.append(
-                {
-                    "role": "assistant",
-                    "content": response.content,
-                }
-            )
-
-            tool_results = []
-
+            working_messages.append({"role": "assistant", "content": response.content})
+            tool_results: list[dict[str, Any]] = []
             for block in response.content:
-                if getattr(block, "type", None) == "tool_use":
-                    result = tool_executor(
-                        block.name,
-                        dict(block.input),
-                    )
-
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result,
-                        }
-                    )
-
-            # All tool results must be sent in ONE user turn.
-            working_messages.append(
-                {
-                    "role": "user",
-                    "content": tool_results,
-                }
-            )
-
+                if getattr(block, "type", None) != "tool_use":
+                    continue
+                result_content = tool_executor(block.name, dict(block.input))
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result_content,
+                    }
+                )
+            working_messages.append({"role": "user", "content": tool_results})
             continue
 
-        # Case 3: Anything else is unexpected.
         raise UnexpectedStopReason(
-            f"Unexpected stop_reason on turn {turn}: {response.stop_reason}"
+            f"turn {turn}: unexpected stop_reason={response.stop_reason!r}"
         )
